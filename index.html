@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEW OpenDRIVE Road Editor (Mapbox)</title>
+    <link
+      href="https://api.tiles.mapbox.com/mapbox-gl-js/v3.11.0/mapbox-gl.css"
+      rel="stylesheet"
+    />
+    <script src="https://api.tiles.mapbox.com/mapbox-gl-js/v3.11.0/mapbox-gl.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/proj4@2.15.0/dist/proj4.min.js"></script>
+    <script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      #map {
+        position: absolute;
+        bottom: 0;
+        width: 100%;
+        height: 100%;
+        transition: height 0.3s;
+      }
+      .panel {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        background: rgba(255,255,255,0.95);
+        border-radius: 6px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+        padding: 10px;
+        min-width: 280px;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        font-size: 12px;
+        line-height: 1.4;
+        z-index: 10;
+      }
+      .panel h3 { margin: 0 0 6px; font-size: 14px; }
+      .row { display: flex; gap: 6px; margin-bottom: 6px; align-items: center; }
+      .row > * { flex: 1; }
+      .panel button, .panel select { font-size: 12px; padding: 6px 8px; }
+      .panel textarea {
+        width: 100%;
+        height: 140px;
+        resize: vertical;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+        font-size: 11px;
+      }
+      .badge { background:#f2f2f2; padding:2px 6px; border-radius:3px; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div class="panel" id="panel">
+      <h3>OpenDRIVE Editor</h3>
+      <div class="row">
+        <button id="exportXodr">Export XODR</button>
+        <button id="importXodr">Import XODR</button>
+      </div>
+      <div class="row">
+        <button id="downloadGeojson" onclick="downloadGeoJSON()">Download GeoJSON</button>
+      </div>
+      <div id="dropHint" style="padding:6px;border:1px dashed #bbb;border-radius:4px;background:#fafafa;color:#666;text-align:center;">
+        Drop .xodr here to load
+      </div>
+    </div>
+    <script type="module" src="index.js"></script>
+    <script>
+      function downloadGeoJSON() {
+        try {
+          if (typeof buildGeo !== 'function') { alert('Geo builder not ready'); return; }
+          const g = buildGeo();
+          const bundle = { type: 'FeatureCollection', features: [] };
+          const pushAll = (fc, layer) => {
+            if (!fc || !fc.features) return;
+            for (const f of fc.features) {
+              const c = JSON.parse(JSON.stringify(f));
+              c.properties = Object.assign({ layer }, c.properties || {});
+              bundle.features.push(c);
+            }
+          };
+          pushAll(g.centerlines, 'center');
+          pushAll(g.lanes, 'lane');
+          pushAll(g.sidewalks, 'sidewalk');
+          pushAll(g.markings, 'marking');
+          pushAll(g.edges, 'edge');
+          pushAll(g.intersection, 'intersection');
+          const blob = new Blob([JSON.stringify(bundle)], { type: 'application/geo+json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'opendrive_geometry.geojson';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        } catch (e) {
+          alert('Failed to export GeoJSON: ' + e.message);
+        }
+      }
+    </script>
+</body>
+</html>

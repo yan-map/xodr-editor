@@ -1,0 +1,822 @@
+    1 import { parseOpenDrive, laneWidthAt } from './xodr/opendrive.js';
+    2 import {
+    3   sampleGeometrySequence,
+    4   offsetPolyline,
+    5   toLineString,
+    6   toPolygon,
+    7   fc,
+    8 } from './xodr/geometry.js';
+    9 
+   10 const DEBUG = false; // set true to enable verbose logging & debug layers
+   11 
+   12 mapboxgl.accessToken =
+   13   "pk.eyJ1IjoieWFucG9ndXRzYSIsImEiOiJjajBhMzJydzIwZmtmMndvY3ozejFicTdqIn0.T6DCFk1BSoEkdG-2agIoQQ";
+   14 const CENTER_LONLAT = [76.9373962233488, 43.23986449911439];
+   15 
+   16 var map = new mapboxgl.Map({
+   17   container: "map",
+   18   style: {
+   19     version: 8,
+   20     name: "Empty",
+   21     metadata: {
+   22       "mapbox:autocomposite": true,
+   23     },
+   24     glyphs: "mapbox://fonts/mapbox/{fontstack}/{range}.pbf",
+   25     sources: {},
+   26     layers: [
+   27       {
+   28         id: "background",
+   29         type: "background",
+   30         paint: {
+   31           "background-color": "rgba(0, 0, 0, 0)",
+   32         },
+   33       },
+   34     ],
+   35   }, //"mapbox://styles/mapbox/satellite-v9" ,
+   36   hash: true,
+   37   attributionControl: false,
+   38   center: CENTER_LONLAT,
+   39   minZoom: 2,
+   40   zoom: 15,
+   41   bearingSnap: 30,
+   42   antialias: true,
+   43 });
+   44 
+   45 // --- Projection helpers (local tangent plane using tmerc centered at map center) ---
+   46 const centerLat = CENTER_LONLAT[1];
+   47 const centerLon = CENTER_LONLAT[0];
+   48 const localProj = `+proj=tmerc +lat_0=${centerLat} +lon_0=${centerLon} +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs`;
+   49 proj4.defs("LOCAL_TAN", localProj);
+   50 const WGS84 = proj4("WGS84");
+   51 const LOCAL = proj4("LOCAL_TAN");
+   52 
+   53 // Build a projector for OpenDRIVE local coordinates using header lat_0/lon_0 if provided
+   54 function makeProjector(lat0, lon0) {
+   55   const projDef = `+proj=tmerc +lat_0=${lat0 ?? centerLat} +lon_0=${lon0 ?? centerLon} +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs`;
+   56   const LOCAL_ODR = proj4(projDef);
+   57   return function odrXYtoLngLat([x, y]) {
+   58     return proj4(LOCAL_ODR, WGS84, [x, y]);
+   59   };
+   60 }
+   61 
+   62 // Global state
+   63 let currentModel = null;
+   64 let currentGeo = null;
+   65 let mapLoaded = false;
+   66 let lastXodrText = '';
+   67 
+   68 map.on('load', () => {
+   69   mapLoaded = true;
+   70   ensureLayers();
+   71   if (currentGeo) updateSources(currentGeo);
+   72 });
+   73 
+   74 // Wire UI
+   75 window.addEventListener('DOMContentLoaded', () => {
+   76   document.getElementById('importXodr').addEventListener('click', () => {
+   77     const inp = document.createElement('input');
+   78     inp.type = 'file';
+   79     inp.accept = '.xodr,.xml,text/xml,application/xml';
+   80     inp.onchange = async () => {
+   81       const f = inp.files && inp.files[0];
+   82       if (!f) return;
+   83       const text = await f.text();
+   84       clearSources();
+   85       lastXodrText = text;
+   86       loadXodr(text);
+   87     };
+   88     inp.click();
+   89   });
+   90   document.getElementById('exportXodr').addEventListener('click', () => {
+   91     const text = lastXodrText || '';
+   92     const blob = new Blob([text], { type: 'application/xml' });
+   93     const url = URL.createObjectURL(blob);
+   94     const a = document.createElement('a');
+   95     a.href = url;
+   96     a.download = 'export.xodr';
+   97     document.body.appendChild(a);
+   98     a.click();
+   99     a.remove();
+  100     URL.revokeObjectURL(url);
+  101   });
+  102 
+  103   // Drag & drop on the panel
+  104   const panel = document.getElementById('panel');
+  105   const dropHint = document.getElementById('dropHint');
+  106   const setPanelDrop = (on) => {
+  107     if (!dropHint) return;
+  108     dropHint.style.background = on ? '#eef7ff' : '#fafafa';
+  109     dropHint.style.borderColor = on ? '#7fb3ff' : '#bbb';
+  110     dropHint.textContent = on ? 'Drop to load .xodr' : 'Drop .xodr here to load';
+  111   };
+  112   ;['dragenter','dragover'].forEach(ev => panel.addEventListener(ev, (e)=>{ e.preventDefault(); e.stopPropagation(); setPanelDrop(true);}));
+  113   ;['dragleave','dragend'].forEach(ev => panel.addEventListener(ev, (e)=>{ e.preventDefault(); e.stopPropagation(); setPanelDrop(false);}));
+  114   panel.addEventListener('drop', async (e) => {
+  115     e.preventDefault(); e.stopPropagation(); setPanelDrop(false);
+  116     const f = (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) || null;
+  117     if (!f) return;
+  118     const text = await f.text();
+  119     clearSources();
+  120     lastXodrText = text;
+  121     loadXodr(text);
+  122   });
+  123 
+  124   // Try to load bundled test.xodr automatically
+  125   fetch('test.xodr').then(r => r.text()).then(t => { lastXodrText = t; loadXodr(t); }).catch(() => {});
+  126 });
+  127 
+  128 function loadXodr(xmlText) {
+  129   try {
+  130     const model = parseOpenDrive(xmlText);
+  131     currentModel = model;
+  132     const projector = makeProjector(model.header.lat0, model.header.lon0);
+  133     const geo = buildGeometry(model, projector);
+  134     currentGeo = geo;
+  135     if (mapLoaded) {
+  136       ensureLayers();
+  137       updateSources(geo);
+  138     }
+  139     if (geo.bounds) {
+  140       map.fitBounds(geo.bounds, { padding: 40, duration: 0 });
+  141     }
+  142   } catch (e) {
+  143     alert('Failed to parse OpenDRIVE: ' + e.message);
+  144     console.error(e);
+  145   }
+  146 }
+  147 
+  148 function buildGeometry(model, projector) {
+  149   const centerFeatures = [];
+  150   const laneFeatures = [];
+  151   const markingFeatures = [];
+  152   const sidewalkFeatures = [];
+  153   const edgeFeatures = [];
+  154   let __uid = 0;
+  155   const nextId = (prefix) => `${prefix}_${++__uid}`;
+  156 
+  157   let minx = +Infinity, miny = +Infinity, maxx = -Infinity, maxy = -Infinity;
+  158 
+  159   for (const road of model.roads) {
+  160     if (!road.planView || road.planView.length === 0) continue;
+  161     let samples = sampleGeometrySequence(road.planView, { step: 0.6, maxAngle: 0.03 });
+  162     if (samples.length < 2) continue;
+  163 
+  164     // bounds in local xy
+  165     for (const [x, y] of samples) {
+  166       if (x < minx) minx = x; if (y < miny) miny = y; if (x > maxx) maxx = x; if (y > maxy) maxy = y;
+  167     }
+  168 
+  169     centerFeatures.push(toLineString(samples, projector));
+  170 
+  171     // lanes: compute per-s sample offsets for each lane id on both sides
+  172     // enrich samples: enforce points at laneSection boundaries and width sOffsets to preserve exact joins
+  173     const enforceS = new Set();
+  174     for (const ls of road.laneSections) {
+  175       enforceS.add(ls.s || 0);
+  176       const pushWidths = (arr) => {
+  177         for (const ln of (arr || [])) {
+  178           for (const w of (ln.widths || [])) enforceS.add((ls.s || 0) + (w.sOffset || 0));
+  179         }
+  180       };
+  181       pushWidths(ls.left); pushWidths(ls.right);
+  182     }
+  183     // ensure sorted and unique
+  184     const ticks = Array.from(enforceS).filter(Number.isFinite).sort((a,b)=>a-b);
+  185     if (ticks.length) {
+  186       const sIdx = samples.map(p=>p[3]);
+  187       const out = [samples[0]];
+  188       for (let i=1;i<samples.length;i++){
+  189         const s0 = sIdx[i-1], s1 = sIdx[i];
+  190         const p0 = samples[i-1], p1 = samples[i];
+  191         // insert any ticks strictly between s0 and s1
+  192         for (const t of ticks) {
+  193           if (t > s0 + 1e-9 && t < s1 - 1e-9) {
+  194             const tt = (t - s0) / (s1 - s0);
+  195             out.push(interpPoint(p0, p1, tt));
+  196           }
+  197         }
+  198         out.push(p1);
+  199       }
+  200       samples = out.sort((a,b)=>a[3]-b[3]);
+  201     }
+  202 
+  203     const sIndex = samples.map((p) => p[3]);
+  204 
+  205     function sectionAt(s) {
+  206       // choose last laneSection with s <= s
+  207       let sec = road.laneSections[0] || null;
+  208       for (const ls of road.laneSections) {
+  209         if (s + 1e-9 >= (ls.s || 0)) sec = ls;
+  210       }
+  211       return sec;
+  212     }
+  213 
+  214     function laneOffsetAt(s) {
+  215       const arr = road.laneOffsets || [];
+  216       if (!arr.length) return 0;
+  217       let rec = arr[0];
+  218       for (const r of arr) { if (s + 1e-9 >= (r.s||0)) rec = r; }
+  219       const ds = s - (rec.s || 0);
+  220       return rec.a + rec.b * ds + rec.c * ds * ds + rec.d * ds * ds * ds;
+  221     }
+  222 
+  223     // Build offsets using CubicSpline sums and lane tracks
+  224 
+  225     const EPS = 0.005; // meters; threshold where lane is considered vanished (smaller to avoid visible wedges)
+  226     const sectionBounds = (road.laneSections || []).map(ls => ls.s || 0).filter(s => s>0).sort((a,b)=>a-b);
+  227 
+  228     function interpPoint(p1, p2, t) {
+  229       const x = p1[0] + (p2[0] - p1[0]) * t;
+  230       const y = p1[1] + (p2[1] - p1[1]) * t;
+  231       const th = p1[2] + (p2[2] - p1[2]) * t;
+  232       const s = p1[3] + (p2[3] - p1[3]) * t;
+  233       return [x, y, th, s];
+  234     }
+  235 
+  236     function laneTypeAt(side, laneId, s) {
+  237       const sec = sectionAt(s);
+  238       const ln = (sec?.[side] || []).find(l => l.id === laneId);
+  239       return ln ? (ln.type || 'none') : 'none';
+  240     }
+  241 
+  242     function computeOffsets(side, laneId, s, secOverride) {
+  243       const sec = secOverride || sectionAt(s);
+  244       const widths = (sec?.[side] || []).map((ln) => ({ id: ln.id, widths: ln.widths }));
+  245       const thisLane = widths.find(w => w.id === laneId);
+  246       const wCur = laneWidthAt(thisLane?.widths || [], s - (sec?.s || 0));
+  247       let outer = laneOffsetAt(s);
+  248       if (side === 'left') {
+  249         for (const ln of widths) {
+  250           const w = laneWidthAt(ln.widths, s - (sec?.s || 0));
+  251           if (ln.id <= laneId) outer += w;
+  252         }
+  253         return { wCur, outer, inner: outer - wCur };
+  254       } else {
+  255         const sorted = widths.slice().sort((a,b)=>a.id-b.id);
+  256         for (const ln of sorted) {
+  257           const w = laneWidthAt(ln.widths, s - (sec?.s || 0));
+  258           if (ln.id >= laneId) outer -= w;
+  259         }
+  260         return { wCur, outer, inner: outer + wCur };
+  261       }
+  262     }
+  263 
+  264     function buildLaneRuns(side, laneId) {
+  265       const features = [];
+  266       let runOuter = [];
+  267       let runInner = [];
+  268       let active = false;
+  269       let prevWidth = 0;
+  270       let runType = null;
+  271       for (let i = 0; i < samples.length; i++) {
+  272         const s = sIndex[i];
+  273         const { wCur, outer, inner } = computeOffsets(side, laneId, s);
+  274         const pOuter = offsetPoint(samples[i], outer);
+  275         const pInner = offsetPoint(samples[i], inner);
+  276         const typeNow = laneTypeAt(side, laneId, s);
+  277 
+  278         const widthOk = wCur > EPS;
+  279         if (widthOk) {
+  280           if (!active) {
+  281             runType = typeNow;
+  282             // starting a run: add boundary point at EPS if crossing
+  283             if (i > 0 && prevWidth <= EPS) {
+  284               const s0 = sIndex[i-1];
+  285               const s1 = sIndex[i];
+  286               const sec0 = sectionAt(s0);
+  287               const widths0 = (sec0?.[side] || []).map((ln) => ({ id: ln.id, widths: ln.widths }));
+  288               const this0 = widths0.find(w => w.id === laneId);
+  289               const w0 = laneWidthAt(this0?.widths || [], s0 - (sec0?.s || 0));
+  290               const w1 = wCur;
+  291               const t = (w1 - w0) !== 0 ? (EPS - w0) / (w1 - w0) : 0;
+  292               const sp = interpPoint(samples[i-1], samples[i], t);
+  293               // Use linear interp of already computed outer offsets
+  294               const offPrevOuter = (side==='left' ? (function(){
+  295                 let sum = laneOffsetAt(s0);
+  296                 for (const ln of widths0) { const w = laneWidthAt(ln.widths, s0 - (sec0?.s||0)); if (ln.id <= laneId) sum += w; }
+  297                 return sum; })() : (function(){
+  298                 let sum = laneOffsetAt(s0);
+  299                 const sorted0 = widths0.slice().sort((a,b)=>a.id-b.id);
+  300                 for (const ln of sorted0) { const w = laneWidthAt(ln.widths, s0 - (sec0?.s||0)); if (ln.id >= laneId) sum -= w; }
+  301                 return sum; })());
+  302               const offStart = offPrevOuter + ( ( (side==='left') ? -1 : +1) * (w0 - EPS) ); // inner will use EPS
+  303               const offEnd = outer + ( ( (side==='left') ? -1 : +1) * (w1 - EPS) );
+  304               const offOuterInterp = offPrevOuter + (outer - offPrevOuter) * t;
+  305               const spOuter = offsetPoint(sp, offOuterInterp);
+  306               const spInner = offsetPoint(sp, side==='left' ? (offOuterInterp - EPS) : (offOuterInterp + EPS));
+  307               runOuter.push(spOuter);
+  308               runInner.push(spInner);
+  309             }
+  310             active = true;
+  311           }
+  312           // laneSection boundary with potential type change
+  313           if (i > 0) {
+  314             const s0 = sIndex[i-1];
+  315             const s1 = sIndex[i];
+  316             for (const sb of sectionBounds) {
+  317               if (s0 < sb && sb <= s1 + 1e-9) {
+  318                 const typeBefore = laneTypeAt(side, laneId, sb - 1e-6);
+  319                 const typeAfter = laneTypeAt(side, laneId, sb + 1e-6);
+  320                 // Always insert exact boundary point using next section offsets to start slope immediately
+  321                 const tB = (sb - s0) / (s1 - s0);
+  322                 const spB = interpPoint(samples[i-1], samples[i], tB);
+  323                 const offAfter = computeOffsets(side, laneId, sb + 1e-6, sectionAt(sb + 1e-6));
+  324                 if (offAfter.wCur > EPS) {
+  325                   const pO = offsetPoint(spB, offAfter.outer);
+  326                   const pI = offsetPoint(spB, offAfter.inner);
+  327                   runOuter.push(pO);
+  328                   runInner.push(pI);
+  329                 }
+  330                 if (typeBefore !== typeAfter) {
+  331                   const t = (sb - s0) / (s1 - s0);
+  332                   const sp = interpPoint(samples[i-1], samples[i], t);
+  333                   const offB = computeOffsets(side, laneId, sb - 1e-6, sectionAt(sb - 1e-6));
+  334                   const pOB = offsetPoint(sp, offB.outer);
+  335                   const pIB = offsetPoint(sp, offB.inner);
+  336                   runOuter.push(pOB);
+  337                   runInner.push(pIB);
+  338                   if (runOuter.length >= 2 && runInner.length >= 2) {
+  339                     const props = { side, laneId, laneType: runType || typeBefore, roadId: road.id, roadName: road.name || '', roadLength: road.length };
+  340                     const feat = side==='left' ? toPolygon(runOuter, runInner, projector, props) : toPolygon(runInner, runOuter, projector, props);
+  341                     feat.id = `r${road.id}_l${laneId}_${runOuter[0][3].toFixed(2)}`;
+  342                     feat.properties.fid = feat.id;
+  343                     features.push(feat);
+  344                     const innerLine = toLineString(runInner, projector);
+  345                     innerLine.properties = { kind: 'lane_inner', side, laneId, roadId: road.id };
+  346                     markingFeatures.push(innerLine);
+  347                   }
+  348                   runOuter = [];
+  349                   runInner = [];
+  350                   active = false;
+  351                   runType = null;
+  352 
+  353                   // start new run immediately on the next section if width there is > EPS
+  354                   const offA = computeOffsets(side, laneId, sb + 1e-6, sectionAt(sb + 1e-6));
+  355                   if (offA.wCur > EPS) {
+  356                     const pOA = offsetPoint(sp, offA.outer);
+  357                     const pIA = offsetPoint(sp, offA.inner);
+  358                     runOuter.push(pOA);
+  359                     runInner.push(pIA);
+  360                     active = true;
+  361                     runType = typeAfter;
+  362                   }
+  363                 }
+  364               }
+  365             }
+  366           }
+  367           runOuter.push(pOuter);
+  368           runInner.push(pInner);
+  369         } else if (active) {
+  370           // finishing a run: add boundary point at EPS if crossing
+  371           if (i > 0) {
+  372             const s0 = sIndex[i-1];
+  373             const s1 = sIndex[i];
+  374             const sec0 = sectionAt(s0);
+  375             const widths0 = (sec0?.[side] || []).map((ln) => ({ id: ln.id, widths: ln.widths }));
+  376             const this0 = widths0.find(w => w.id === laneId);
+  377             const w0 = laneWidthAt(this0?.widths || [], s0 - (sec0?.s || 0));
+  378             const w1 = wCur;
+  379             const t = (w1 - w0) !== 0 ? (EPS - w0) / (w1 - w0) : 0;
+  380             const sp = interpPoint(samples[i-1], samples[i], t);
+  381             // outer offset interpolation
+  382             const offPrevOuter = (side==='left' ? (function(){
+  383               let sum = laneOffsetAt(s0);
+  384               for (const ln of widths0) { const w = laneWidthAt(ln.widths, s0 - (sec0?.s||0)); if (ln.id <= laneId) sum += w; }
+  385               return sum; })() : (function(){
+  386               let sum = laneOffsetAt(s0);
+  387               const sorted0 = widths0.slice().sort((a,b)=>a.id-b.id);
+  388               for (const ln of sorted0) { const w = laneWidthAt(ln.widths, s0 - (sec0?.s||0)); if (ln.id >= laneId) sum -= w; }
+  389               return sum; })());
+  390             const offOuterInterp = offPrevOuter + (outer - offPrevOuter) * t;
+  391             const spOuter = offsetPoint(sp, offOuterInterp);
+  392             const spInner = offsetPoint(sp, side==='left' ? (offOuterInterp - EPS) : (offOuterInterp + EPS));
+  393             runOuter.push(spOuter);
+  394             runInner.push(spInner);
+  395           }
+  396           // finish feature
+  397           if (runOuter.length >= 2 && runInner.length >= 2) {
+  398             const props = { side, laneId, laneType: laneTypeFor(road, side, laneId), roadId: road.id, roadName: road.name || '', roadLength: road.length };
+  399             const feat = side==='left' ? toPolygon(runOuter, runInner, projector, props) : toPolygon(runInner, runOuter, projector, props);
+  400             feat.id = `r${road.id}_l${laneId}_${runOuter[0][3].toFixed(2)}`;
+  401             feat.properties.fid = feat.id;
+  402             features.push(feat);
+  403             // Add inner boundary as marking line
+  404             const innerLine = toLineString(runInner, projector);
+  405             innerLine.properties = { kind: 'lane_inner', side, laneId, roadId: road.id };
+  406             markingFeatures.push(innerLine);
+  407           }
+  408           runOuter = [];
+  409           runInner = [];
+  410           active = false;
+  411         }
+  412         prevWidth = wCur;
+  413       }
+  414       // finalize last run
+  415       if (active && runOuter.length >= 2 && runInner.length >= 2) {
+  416         const props = { side, laneId, laneType: laneTypeFor(road, side, laneId), roadId: road.id, roadName: road.name || '', roadLength: road.length };
+  417         const feat = side==='left' ? toPolygon(runOuter, runInner, projector, props) : toPolygon(runInner, runOuter, projector, props);
+  418         feat.id = `r${road.id}_l${laneId}_${runOuter[0][3].toFixed(2)}`;
+  419         feat.properties.fid = feat.id;
+  420         features.push(feat);
+  421         const innerLine = toLineString(runInner, projector);
+  422         innerLine.properties = { kind: 'lane_inner', side, laneId, roadId: road.id };
+  423         markingFeatures.push(innerLine);
+  424       }
+  425       return features;
+  426     }
+  427 
+  428     // Build and render using lane tracks across sections
+  429     function buildTracks(side) {
+  430       const tracks = [];
+  431       const nodes = new Map();
+  432       for (let si=0; si<road.laneSections.length; si++){
+  433         const ls = road.laneSections[si];
+  434         for (const ln of (ls[side]||[])) {
+  435           nodes.set(`${si}:${ln.id}`, { si, id: ln.id, pred: ln.predecessor, succ: ln.successor, type: ln.type });
+  436         }
+  437       }
+  438       const starts = [];
+  439       for (let si=0; si<road.laneSections.length; si++){
+  440         const ls = road.laneSections[si];
+  441         for (const ln of (ls[side]||[])) {
+  442           const key = `${si}:${ln.id}`;
+  443           const prevKey = si>0 ? `${si-1}:${ln.predecessor}` : null;
+  444           if (!prevKey || !nodes.has(prevKey)) starts.push(nodes.get(key));
+  445         }
+  446       }
+  447       for (const st of starts){
+  448         const track = []; let cur = st;
+  449         while (cur){ track.push(cur); const nsi = cur.si+1; const nls = road.laneSections[nsi]; if (!nls) break; let nextKey = null; if (cur.succ!=null && nodes.has(`${nsi}:${cur.succ}`)) nextKey = `${nsi}:${cur.succ}`; if (!nextKey){ for (const ln of (nls[side]||[])) { if (ln.predecessor === cur.id) { nextKey = `${nsi}:${ln.id}`; break; } }} cur = nextKey ? nodes.get(nextKey) : null; }
+  450         tracks.push({ side, nodes: track });
+  451       }
+  452       return tracks;
+  453     }
+  454     const tracksLeft = buildTracks('left');
+  455     const tracksRight = buildTracks('right');
+  456 
+  457     function buildLaneRunsTrack(track) {
+  458       const features = [];
+  459       let runOuter = [];
+  460       let runInner = [];
+  461       let active = false;
+  462       let prevWidth = 0;
+  463       let runType = null;
+  464       for (let i=0;i<samples.length;i++){
+  465         const s = sIndex[i];
+  466         const sec = sectionAt(s);
+  467         const si = road.laneSections.indexOf(sec);
+  468         const node = track.nodes.find(n=>n.si===si);
+  469         if (!node){
+  470           if (active){
+  471             if (runOuter.length>=2 && runInner.length>=2){
+  472             const s0 = runOuter[0][3];
+  473             const s1 = runOuter[runOuter.length-1][3];
+  474             const props = { side: track.side, laneId: 'track', laneType: runType||'', roadId: road.id, roadName: road.name||'', roadLength: road.length, s0, s1, secStartS: sectionAt(s0)?.s || 0, secEndS: sectionAt(s1)?.s || 0 };
+  475             const feat = track.side==='left' ? toPolygon(runOuter, runInner, projector, props) : toPolygon(runInner, runOuter, projector, props);
+  476             const laneIdUniq = nextId('lane');
+  477             feat.id = laneIdUniq; feat.properties.fid = laneIdUniq; features.push(feat);
+  478             const innerLine = toLineString(runInner, projector); innerLine.properties = { kind:'lane_inner', side: track.side, roadId: road.id, s0, s1, secStartS: props.secStartS, secEndS: props.secEndS }; const mid = nextId('mark'); innerLine.id = mid; innerLine.properties.mid = mid; markingFeatures.push(innerLine);
+  479             }
+  480             runOuter=[]; runInner=[]; active=false; prevWidth=0;
+  481           }
+  482           continue;
+  483         }
+  484         // compute offsets using node.id in this section
+  485         const side = track.side;
+  486         const widths = (sec?.[side] || []).map(ln=>({ id: ln.id, widths: ln.widths, type: ln.type }));
+  487         const thisLane = widths.find(w=>w.id===node.id);
+  488         const wCur = laneWidthAt(thisLane?.widths||[], s-(sec?.s||0));
+  489         let outer = laneOffsetAt(s);
+  490         if (side==='left'){
+  491           for (const ln of widths){ const w = laneWidthAt(ln.widths, s-(sec?.s||0)); if (ln.id<=node.id) outer += w; }
+  492         } else {
+  493           const sorted = widths.slice().sort((a,b)=>a.id-b.id);
+  494           for (const ln of sorted){ const w = laneWidthAt(ln.widths, s-(sec?.s||0)); if (ln.id>=node.id) outer -= w; }
+  495         }
+  496         const inner = side==='left' ? (outer - wCur) : (outer + wCur);
+  497         const pOuter = offsetPoint(samples[i], outer);
+  498         const pInner = offsetPoint(samples[i], inner);
+  499         const typeNow = (thisLane && (thisLane.type||'none')) || 'none';
+  500         const widthOk = wCur > EPS;
+  501         if (widthOk){
+  502           if (!active){
+  503             runType = typeNow; active = true;
+  504             if (i>0 && prevWidth<=EPS){
+  505               const s0=sIndex[i-1], s1=sIndex[i];
+  506               const sec0 = sectionAt(s0);
+  507               const si0 = road.laneSections.indexOf(sec0);
+  508               const node0 = track.nodes.find(n=>n.si===si0) || node;
+  509               const widths0 = (sec0?.[side] || []).map(ln=>({id:ln.id, widths: ln.widths}));
+  510               const this0 = widths0.find(w=>w.id===node0.id);
+  511               const w0 = laneWidthAt(this0?.widths||[], s0-(sec0?.s||0));
+  512               const t = (wCur - w0)!==0 ? (EPS - w0)/(wCur - w0) : 0;
+  513               const sp = interpPoint(samples[i-1], samples[i], t);
+  514               let offPrevOuter = laneOffsetAt(s0);
+  515               if (side==='left'){ for (const ln of widths0){ const w=laneWidthAt(ln.widths, s0-(sec0?.s||0)); if (ln.id<=node0.id) offPrevOuter+=w; } }
+  516               else { const sorted=widths0.slice().sort((a,b)=>a.id-b.id); for (const ln of sorted){ const w=laneWidthAt(ln.widths, s0-(sec0?.s||0)); if (ln.id>=node0.id) offPrevOuter-=w; } }
+  517               const offOuterInterp = offPrevOuter + (outer - offPrevOuter)*t;
+  518               runOuter.push(offsetPoint(sp, offOuterInterp));
+  519               runInner.push(offsetPoint(sp, side==='left'? (offOuterInterp - EPS):(offOuterInterp + EPS)));
+  520             }
+  521           }
+  522           runOuter.push(pOuter); runInner.push(pInner);
+  523         } else if (active){
+  524           // close
+  525           if (i>0){
+  526             const s0=sIndex[i-1];
+  527             const sec0=sectionAt(s0);
+  528             const si0=road.laneSections.indexOf(sec0);
+  529             const node0=track.nodes.find(n=>n.si===si0) || node;
+  530             const widths0=(sec0?.[side]||[]).map(ln=>({id:ln.id, widths:ln.widths}));
+  531             const this0=widths0.find(w=>w.id===node0.id);
+  532             const w0=laneWidthAt(this0?.widths||[], s0-(sec0?.s||0));
+  533             const t=(wCur - w0)!==0 ? (EPS - w0)/(wCur - w0) : 0;
+  534             const sp=interpPoint(samples[i-1], samples[i], t);
+  535             let offPrevOuter = laneOffsetAt(s0);
+  536             if (side==='left'){ for (const ln of widths0){ const w=laneWidthAt(ln.widths, s0-(sec0?.s||0)); if (ln.id<=node0.id) offPrevOuter+=w; } }
+  537             else { const sorted=widths0.slice().sort((a,b)=>a.id-b.id); for (const ln of sorted){ const w=laneWidthAt(ln.widths, s0-(sec0?.s||0)); if (ln.id>=node0.id) offPrevOuter-=w; } }
+  538             const offOuterInterp = offPrevOuter + (outer - offPrevOuter)*t;
+  539             runOuter.push(offsetPoint(sp, offOuterInterp));
+  540             runInner.push(offsetPoint(sp, side==='left'? (offOuterInterp - EPS):(offOuterInterp + EPS)));
+  541           }
+  542           if (runOuter.length>=2 && runInner.length>=2){
+  543             const s0 = runOuter[0][3];
+  544             const s1 = runOuter[runOuter.length-1][3];
+  545             const props = { side, laneId: node.id, laneType: runType||typeNow, roadId: road.id, roadName: road.name||'', roadLength: road.length, s0, s1, secStartS: sectionAt(s0)?.s || 0, secEndS: sectionAt(s1)?.s || 0 };
+  546             const feat = side==='left' ? toPolygon(runOuter, runInner, projector, props) : toPolygon(runInner, runOuter, projector, props);
+  547             const laneIdUniq = nextId('lane');
+  548             feat.id = laneIdUniq; feat.properties.fid = laneIdUniq; features.push(feat);
+  549             const innerLine = toLineString(runInner, projector); innerLine.properties = { kind:'lane_inner', side, laneId: node.id, roadId: road.id, s0, s1, secStartS: props.secStartS, secEndS: props.secEndS }; const mid = nextId('mark'); innerLine.id = mid; innerLine.properties.mid = mid; markingFeatures.push(innerLine);
+  550           }
+  551           runOuter=[]; runInner=[]; active=false;
+  552         }
+  553         prevWidth = wCur;
+  554       }
+  555       if (active && runOuter.length>=2 && runInner.length>=2){
+  556         const side = track.side; const nodeLast = track.nodes[track.nodes.length-1];
+  557         const s0 = runOuter[0][3]; const s1 = runOuter[runOuter.length-1][3];
+  558         const props = { side, laneId: nodeLast?.id, laneType: runType||'', roadId: road.id, roadName: road.name||'', roadLength: road.length, s0, s1, secStartS: sectionAt(s0)?.s || 0, secEndS: sectionAt(s1)?.s || 0 };
+  559         const feat = side==='left' ? toPolygon(runOuter, runInner, projector, props) : toPolygon(runInner, runOuter, projector, props);
+  560         const laneIdUniq = nextId('lane');
+  561         feat.id = laneIdUniq; feat.properties.fid = laneIdUniq; features.push(feat);
+  562         const innerLine = toLineString(runInner, projector); innerLine.properties = { kind:'lane_inner', side, laneId: nodeLast?.id, roadId: road.id, s0, s1, secStartS: props.secStartS, secEndS: props.secEndS }; const mid = nextId('mark'); innerLine.id = mid; innerLine.properties.mid = mid; markingFeatures.push(innerLine);
+  563       }
+  564       return features;
+  565     }
+  566 
+  567     for (const tr of tracksLeft) laneFeatures.push(...buildLaneRunsTrack(tr));
+  568     for (const tr of tracksRight) laneFeatures.push(...buildLaneRunsTrack(tr));
+  569 
+  570     // Carriageway outer edges (exclude sidewalks)
+  571     const leftEdge = [];
+  572     const rightEdge = [];
+  573     for (let i = 0; i < samples.length; i++) {
+  574       const s = sIndex[i];
+  575       const sec = sectionAt(s);
+  576       const lo = laneOffsetAt(s);
+  577       let sumLeft = 0;
+  578       for (const ln of (sec?.left || [])) {
+  579         if ((ln.type || 'none') === 'sidewalk') continue;
+  580         const w = laneWidthAt(ln.widths, s - (sec?.s || 0));
+  581         sumLeft += w;
+  582       }
+  583       let sumRight = 0;
+  584       // right: sum absolute widths of considered lanes
+  585       const sortedRight = (sec?.right || []).slice().sort((a,b)=>a.id-b.id);
+  586       for (const ln of sortedRight) {
+  587         if ((ln.type || 'none') === 'sidewalk') continue;
+  588         const w = laneWidthAt(ln.widths, s - (sec?.s || 0));
+  589         sumRight += w;
+  590       }
+  591       const pL = offsetPoint(samples[i], lo + sumLeft);
+  592       const pR = offsetPoint(samples[i], lo - sumRight);
+  593       leftEdge.push(pL);
+  594       rightEdge.push(pR);
+  595     }
+  596     const leftEdgeLine = toLineString(leftEdge, projector); leftEdgeLine.properties = { kind: 'edge', side: 'left', roadId: road.id };
+  597     const rightEdgeLine = toLineString(rightEdge, projector); rightEdgeLine.properties = { kind: 'edge', side: 'right', roadId: road.id };
+  598     edgeFeatures.push(leftEdgeLine, rightEdgeLine);
+  599   }
+  600 
+  601   const bounds = (isFinite(minx) ? new mapboxgl.LngLatBounds(
+  602     projector([minx, miny]), projector([maxx, maxy])
+  603   ) : null);
+  604 
+  605   const centerlines = fc(centerFeatures);
+  606   const lanes = fc(laneFeatures);
+  607   const markings = fc(markingFeatures);
+  608   const sidewalks = fc(sidewalkFeatures);
+  609   const edges = fc(edgeFeatures);
+  610   const intersection = fc([]);
+  611   return { centerlines, lanes, markings, sidewalks, edges, intersection, bounds };
+  612 }
+  613 
+  614 function polyEval(coeff, ds) {
+  615   if (!coeff) return 0;
+  616   return coeff.a + coeff.b * ds + coeff.c * ds * ds + coeff.d * ds * ds * ds;
+  617 }
+  618 
+  619 function collectLaneIds(laneSections, side) {
+  620   const set = new Set();
+  621   for (const ls of laneSections || []) {
+  622     for (const ln of (ls?.[side] || [])) set.add(ln.id);
+  623   }
+  624   const ids = Array.from(set);
+  625   // sort left desc (2,1), right asc (-2,-1)
+  626   ids.sort((a,b) => a===b ? 0 : (a>0 && b>0 ? b-a : (a<0 && b<0 ? a-b : a-b)));
+  627   return ids;
+  628 }
+  629 
+  630 function laneTypeFor(road, side, laneId) {
+  631   for (const ls of road.laneSections || []) {
+  632     for (const ln of (ls?.[side] || [])) {
+  633       if (ln.id === laneId) return ln.type || 'none';
+  634     }
+  635   }
+  636   return 'none';
+  637 }
+  638 
+  639 function offsetPoint(sample, offset) {
+  640   const [x, y, th, s] = sample;
+  641   const nx = -Math.sin(th), ny = Math.cos(th);
+  642   return [x + nx * offset, y + ny * offset, th, s];
+  643 }
+  644 
+  645 function ensureLayers() {
+  646   if (!map.getSource('xodr-center')) {
+  647     map.addSource('xodr-center', { type: 'geojson', data: fc() });
+  648     map.addLayer({ id: 'xodr-center', type: 'line', source: 'xodr-center', paint: { 'line-color': 'transparent'/*'#111'*/, 'line-width': 1.5 } });
+  649   }
+  650   if (!map.getSource('xodr-lanes')) {
+  651     map.addSource('xodr-lanes', { type: 'geojson', data: fc() });
+  652     // color lanes by laneType
+  653     map.addLayer({
+  654       id: 'xodr-lanes',
+  655       type: 'fill',
+  656       source: 'xodr-lanes',
+  657       paint: {
+  658         'fill-color': [
+  659           'match', ['get','laneType'],
+  660           'driving', '#3887be',
+  661           'shoulder', '#9e9e9e',
+  662           'sidewalk', '#6fcf97',
+  663           'biking', '#ff6f61',
+  664           'parking', '#f2c94c',
+  665           /* other */ '#cfcfcf'
+  666         ],
+  667         'fill-opacity': 0.4
+  668       }
+  669     });
+  670     map.addLayer({ id: 'xodr-lane-outline', type: 'line', source: 'xodr-lanes', paint: { 'line-color': '#fff', 'line-width': 0.5, 'line-opacity': 0.5 } });
+  671     // markings source/layer
+  672     map.addSource('xodr-markings', { type: 'geojson', data: fc() });
+  673     map.addLayer({ id: 'xodr-markings', type: 'line', source: 'xodr-markings', paint: { 'line-color': '#ffffff', 'line-width': 0.8, 'line-dasharray': [2, 2], 'line-opacity': 0.9 } });
+  674     // outer edges of carriageway
+  675     map.addSource('xodr-edges', { type: 'geojson', data: fc() });
+  676     map.addLayer({ id: 'xodr-edges', type: 'line', source: 'xodr-edges', paint: { 'line-color': '#111', 'line-width': 2.0, 'line-opacity': 0.17 } });
+  677     // Simple hover layers: filter by feature id (exact match)
+  678     map.addLayer({ id: 'xodr-lane-hover', type: 'line', source: 'xodr-lanes', paint: { 'line-color': '#ff0', 'line-width': 2.0 }, filter: ['==', ['id'], ''] });
+  679     map.addLayer({ id: 'xodr-marking-hover', type: 'line', source: 'xodr-markings', paint: { 'line-color': '#ff0', 'line-width': 2.0 }, filter: ['==', ['id'], ''] });
+  680     attachHoverHandlers();
+  681   }
+  682 }
+  683 
+  684 function updateSources(geo) {
+  685   map.getSource('xodr-center').setData(geo.centerlines);
+  686   map.getSource('xodr-lanes').setData(geo.lanes);
+  687   if (map.getSource('xodr-markings')) map.getSource('xodr-markings').setData(geo.markings || fc());
+  688   if (map.getSource('xodr-edges')) map.getSource('xodr-edges').setData(geo.edges || fc());
+  689 }
+  690 
+  691 // Export for download button
+  692 window.buildGeo = function buildGeo() {
+  693   try {
+  694     // Export exactly what is on the map (no modification)
+  695     const bundle = {};
+  696     const ids = [
+  697       ['centerlines','xodr-center'],
+  698       ['lanes','xodr-lanes'],
+  699       ['markings','xodr-markings'],
+  700       ['edges','xodr-edges'],
+  701     ];
+  702     for (const [key, id] of ids) {
+  703       const src = map.getSource(id);
+  704       if (src && (src.getData ? src.getData() : src._data)) {
+  705         bundle[key] = (src.getData ? src.getData() : src._data);
+  706       }
+  707     }
+  708     // Provide fallbacks for absent sources
+  709     return Object.assign({
+  710       centerlines: fc(), lanes: fc(), markings: fc(), edges: fc(), sidewalks: fc(), intersection: fc()
+  711     }, currentGeo || {}, bundle);
+  712   } catch (e) {
+  713     return currentGeo || { centerlines: fc(), lanes: fc(), sidewalks: fc(), markings: fc(), edges: fc(), intersection: fc() };
+  714   }
+  715 }
+  716 
+  717 function clearSources() {
+  718   try {
+  719     ensureLayers();
+  720     const empty = fc();
+  721     if (map.getSource('xodr-center')) map.getSource('xodr-center').setData(empty);
+  722     if (map.getSource('xodr-lanes')) map.getSource('xodr-lanes').setData(empty);
+  723     if (map.getSource('xodr-markings')) map.getSource('xodr-markings').setData(empty);
+  724     if (map.getSource('xodr-edges')) map.getSource('xodr-edges').setData(empty);
+  725     currentGeo = null;
+  726     currentModel = null;
+  727   } catch {}
+  728 }
+  729 
+  730 let hoverPopup = null;
+  731 let hoverId = null;
+  732 let hoverMarkId = null;
+  733 let hoverHandlersAttached = false;
+  734 
+  735 function attachHoverHandlers() {
+  736   if (hoverHandlersAttached) return;
+  737   hoverHandlersAttached = true;
+  738   hoverPopup = new mapboxgl.Popup({ closeButton: false, closeOnClick: false });
+  739 
+  740   map.on('mousemove', 'xodr-lanes', (e) => {
+  741     // Если над markings - сбрасываю
+  742     const pad = 3;
+  743     const box = [[e.point.x-pad, e.point.y-pad],[e.point.x+pad, e.point.y+pad]];
+  744     const markingsCount = map.queryRenderedFeatures(box, { layers: ['xodr-markings'] }).length;
+  745     if (markingsCount>0) return;
+  746 
+  747     const f = (e.features && e.features[0]) || null;
+  748     if (!f) return;
+  749     const fid = f.id || (f.properties && f.properties.fid) || null;
+  750     if (!fid) return;
+  751     if (hoverId !== fid) {
+  752       hoverId = fid;
+  753       map.setFilter('xodr-lane-hover', ['==', 'fid', fid]); 
+  754       map.setFilter('xodr-marking-hover', ['==', 'fid', '']); 
+  755       hoverMarkId = null;
+  756       if (DEBUG) {
+  757         try {
+  758           const pad = 3;
+  759           const box = [[e.point.x-pad, e.point.y-pad],[e.point.x+pad, e.point.y+pad]];
+  760           const hits = map.queryRenderedFeatures(box, { layers: ['xodr-lanes'] }) || [];
+  761           console.log('hover lane id=', fid, 'hits=', hits.length);
+  762         } catch{}
+  763       }
+  764     }
+  765     const p = f.properties || {};
+  766     const html = `
+  767       <div style="font:12px/1.3 system-ui,Segoe UI,Roboto,Arial">
+  768         <div><b>Road:</b> ${escapeHtml(p.roadName || '')} <span style="opacity:.6">(#${p.roadId})</span></div>
+  769         <div><b>Lane:</b> ${p.side} ${p.laneId} <span style="opacity:.6">(${p.laneType||'n/a'})</span></div>
+  770         <div><b>Run s:</b> ${Number(p.s0||0).toFixed(2)} → ${Number(p.s1||0).toFixed(2)} m</div>
+  771         <div><b>Sections:</b> ${Number(p.secStartS||0).toFixed(2)} → ${Number(p.secEndS||0).toFixed(2)} m</div>
+  772       </div>`;
+  773     hoverPopup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+  774   });
+  775   map.on('mouseleave', 'xodr-lanes', () => {
+  776     hoverId = null;
+  777     map.setFilter('xodr-lane-hover', ['==', 'id', '']);
+  778     if (hoverPopup) hoverPopup.remove();
+  779   });
+  780 
+  781   // markings hover
+  782   map.on('mousemove', 'xodr-markings', (e) => {
+  783     const pad = 10;
+  784     const box = [[e.point.x-pad, e.point.y-pad],[e.point.x+pad, e.point.y+pad]];
+  785     const markingsArray = map.queryRenderedFeatures(box, { layers: ['xodr-markings'] });
+  786    if (markingsArray.length==0) return;
+  787 
+  788    const f = markingsArray[0];
+  789     //const f = (e.features && e.features[0]) || null;
+  790     
+  791     const mid = f.id || (f.properties && f.properties.mid) || null;
+  792     if (!mid) return;
+  793     if (hoverMarkId !== mid) {
+  794       hoverMarkId = mid;
+  795       try { map.setFilter('xodr-marking-hover', ['==', 'mid', mid]); } catch {}
+  796       try { map.setFilter('xodr-lane-hover', ['==', 'mid', '']); } catch {}
+  797       hoverId = null;
+  798     }
+  799     const p = f.properties || {};
+  800     const html = `
+  801       <div style="font:12px/1.3 system-ui,Segoe UI,Roboto,Arial">
+  802         <div><b>Marking:</b> ${escapeHtml(p.kind || 'mark')}</div>
+  803         <div><b>Side/Lane:</b> ${p.side||'n/a'} ${p.laneId ?? ''}</div>
+  804         <div><b>Road:</b> #${p.roadId}</div>
+  805         <div><b>Run s:</b> ${Number(p.s0||0).toFixed(2)} → ${Number(p.s1||0).toFixed(2)} m</div>
+  806         <div><b>Sections:</b> ${Number(p.secStartS||0).toFixed(2)} → ${Number(p.secEndS||0).toFixed(2)} m</div>
+  807       </div>`;
+  808     hoverPopup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+  809   });
+  810   
+  811   map.on('mouseleave', 'xodr-markings', () => {
+  812     hoverMarkId = null;
+  813     try { map.setFilter('xodr-marking-hover', ['==', 'mid', '']); } catch {}
+  814     if (hoverPopup) hoverPopup.remove();
+  815   });
+  816   
+  817 }
+  818 
+  819 function escapeHtml(s) {
+  820   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
+  821 }
+
