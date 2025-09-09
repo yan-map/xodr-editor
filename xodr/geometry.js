@@ -4,10 +4,24 @@
 export function sampleGeometrySequence(geoms, opts = {}) {
   const baseStep = opts.step || 0.7; // target max chord length (m)
   const maxAngle = opts.maxAngle || 0.03; // rad per segment
+  const forceSAbs = Array.isArray(opts.forceS) ? opts.forceS.slice().sort((a,b)=>a-b) : null;
   const out = [];
   for (const g of geoms) {
     const baseS = Number(g.s) || 0;
-    const pts = sampleSegmentAdaptive(g, { baseStep, maxAngle });
+    let forceLocal = null;
+    if (forceSAbs && isFinite(g.length)) {
+      const L = Number(g.length) || 0;
+      if (L > 0) {
+        const s0 = baseS, s1 = baseS + L;
+        forceLocal = [];
+        for (const t of forceSAbs) {
+          if (t + 1e-9 >= s0 && t <= s1 + 1e-9) forceLocal.push(t - s0);
+        }
+        // unique/sorted within [0,L]
+        forceLocal = Array.from(new Set(forceLocal.map(v=>Math.min(L, Math.max(0, v))))).sort((a,b)=>a-b);
+      }
+    }
+    const pts = sampleSegmentAdaptive(g, { baseStep, maxAngle, forceLocal });
     // convert local s -> absolute s along road
     for (const p of pts) p[3] = baseS + (p[3] || 0);
     if (out.length && pts.length) {
@@ -119,14 +133,56 @@ export function sampleSegmentAdaptive(geom, opts = {}) {
   if (!(L > 0)) return [];
   const baseStep = Math.max(0.2, opts.baseStep || 0.7);
   const maxAngle = Math.max(0.005, opts.maxAngle || 0.03);
+  const forceLocal = Array.isArray(opts.forceLocal) ? opts.forceLocal : null;
 
-  if (type === 'line') return sampleSegment({ ...geom, type: 'line' }, baseStep);
+  if (type === 'line') {
+    // If we have required local s-positions (e.g., width changes, section joints), sample exactly at them
+    if (forceLocal && forceLocal.length) {
+      const svals = Array.from(new Set([0, ...forceLocal, L])).sort((a,b)=>a-b);
+      const pts = [];
+      for (const s of svals) {
+        const px = x + s * Math.cos(hdg);
+        const py = y + s * Math.sin(hdg);
+        const th = hdg;
+        pts.push([px, py, th, s]);
+      }
+      return pts;
+    }
+    // Otherwise keep regular sampling on lines so downstream width changes are represented
+    return sampleSegment({ ...geom, type: 'line' }, baseStep);
+  }
 
   if (type === 'arc') {
     const k = Number(geom.curvature) || 0;
-    const dsAngle = Math.abs(k) > 1e-12 ? (maxAngle / Math.abs(k)) : L;
-    const ds = Math.min(baseStep, dsAngle);
-    return sampleSegment({ ...geom, type: 'arc' }, ds);
+    if (Math.abs(k) < 1e-12) {
+      // Treat as line (will hit forceLocal if any)
+      return sampleSegmentAdaptive({ ...geom, type: 'line' }, { baseStep, maxAngle, forceLocal });
+    }
+    const sTargets = Array.from(new Set([0, ...(forceLocal||[]), L])).sort((a,b)=>a-b);
+    const pts = [];
+    let s = 0;
+    const invk = 1 / k;
+    let ti = 1; // index in sTargets for next target
+    pts.push([x, y, hdg, 0]);
+    while (s < L - 1e-9) {
+      const dsAngle = maxAngle / Math.abs(k);
+      const nextTarget = sTargets[ti] ?? L;
+      let h = Math.min(baseStep, dsAngle, L - s, nextTarget - s);
+      if (h <= 1e-9) { ti++; continue; }
+      s += h;
+      const th = hdg + k * s;
+      const px = x + (Math.sin(th) - Math.sin(hdg)) * invk;
+      const py = y - (Math.cos(th) - Math.cos(hdg)) * invk;
+      pts.push([px, py, th, s]);
+      if (Math.abs(s - nextTarget) <= 1e-9) ti++;
+    }
+    if (pts[pts.length-1][3] < L - 1e-9) {
+      const th = hdg + k * L;
+      const px = x + (Math.sin(th) - Math.sin(hdg)) / k;
+      const py = y - (Math.cos(th) - Math.cos(hdg)) / k;
+      pts.push([px, py, th, L]);
+    }
+    return pts;
   }
 
   if (type === 'spiral') {
@@ -137,6 +193,8 @@ export function sampleSegmentAdaptive(geom, opts = {}) {
     let s = 0;
     let px = x, py = y, th = hdg;
     const pts = [[px, py, th, 0]];
+    const sTargets = Array.from(new Set([0, ...(forceLocal||[]), L])).sort((a,b)=>a-b);
+    let ti = 1; // next target index
     while (s < L - 1e-9) {
       // choose step by angle change bound: |k0*h + 0.5*dk*h^2| <= maxAngle
       const a = 0.5 * Math.abs(dk);
@@ -149,7 +207,8 @@ export function sampleSegmentAdaptive(geom, opts = {}) {
       } else if (b > 1e-12) {
         h = Math.min(h, maxAngle / b);
       }
-      h = Math.max(0.05, Math.min(h, L - s));
+      const nextTarget = sTargets[ti] ?? L;
+      h = Math.max(0.05, Math.min(h, L - s, nextTarget - s));
 
       // RK4 step for state
       const kfun = (ss) => (k0 + dk * ss);
@@ -167,6 +226,7 @@ export function sampleSegmentAdaptive(geom, opts = {}) {
       th = st[2] + (h/6)*(k1v[2] + 2*k2v[2] + 2*k3v[2] + k4v[2]);
       s += h;
       pts.push([px, py, th, s]);
+      if (Math.abs(s - nextTarget) <= 1e-9) ti++;
     }
     return pts;
   }
@@ -177,6 +237,8 @@ export function sampleSegmentAdaptive(geom, opts = {}) {
     const cosH = Math.cos(hdg), sinH = Math.sin(hdg);
     let s = 0;
     const pts = [];
+    const sTargets = Array.from(new Set([0, ...(forceLocal||[]), L])).sort((a,b)=>a-b);
+    let ti = 1;
     while (s < L + 1e-9) {
       const u = aU + bU*s + cU*s*s + dU*s*s*s;
       const v = aV + bV*s + cV*s*s + dV*s*s*s;
@@ -192,13 +254,15 @@ export function sampleSegmentAdaptive(geom, opts = {}) {
       const ay = d2u * sinH + d2v * cosH;
       const curvature = denom > 1e-9 ? Math.abs((tx*ay - ty*ax) / denom) : 0;
       const dsAngle = curvature > 1e-9 ? maxAngle / curvature : L;
-      const h = Math.min(Math.max(0.2, baseStep), dsAngle, L - s);
+      const nextTarget = sTargets[ti] ?? L;
+      const h = Math.min(Math.max(0.2, baseStep), dsAngle, L - s, nextTarget - s);
 
       const lx = u * cosH - v * sinH;
       const ly = u * sinH + v * cosH;
       pts.push([x + lx, y + ly, th, s]);
       if (s >= L) break;
       s += h;
+      if (Math.abs(s - nextTarget) <= 1e-9) ti++;
       if (s > L) s = L;
     }
     if (pts.length === 0 || pts[pts.length-1][3] < L) {

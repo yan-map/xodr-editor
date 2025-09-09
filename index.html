@@ -11,6 +11,9 @@
     <script src="https://api.tiles.mapbox.com/mapbox-gl-js/v3.11.0/mapbox-gl.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/proj4@2.15.0/dist/proj4.min.js"></script>
     <script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
+    <!-- Spatial index for incremental intersection updates -->
+    <script src="https://unpkg.com/rbush@3.0.1/rbush.min.js"></script>
+    <script src="https://unpkg.com/geojson-rbush@3.2.1/geojson-rbush.min.js"></script>
     <style>
       body {
         margin: 0;
@@ -60,6 +63,33 @@
         <button id="importXodr">Import XODR</button>
       </div>
       <div class="row">
+        <button id="drawAxis" title="Start drawing road axis">Draw Axis</button>
+        <button id="editAxis" title="Enable editing for axes">Edit Axis</button>
+        <select id="qualityPreset" style="flex:6">
+          <option value="poor">Плохая</option>
+          <option value="normal" selected>Нормальная</option>
+          <option value="high">Высокая</option>
+          <option value="ultra">Супер высокая</option>
+        </select>
+      </div>
+      <div class="row" title="Snapping radius in pixels">
+        <span style="flex:3">Snap (px)</span>
+        <input id="snapPx" type="number" min="0" max="40" step="1" value="10" style="flex:6" />
+      </div>
+      <div class="row" title="Vertex snapping radius in pixels (priority over segments)">
+        <span style="flex:3">Snap Vertex (px)</span>
+        <input id="snapVertexPx" type="number" min="0" max="60" step="1" value="16" style="flex:6" />
+      </div>
+      <div class="row" title="Фиксированные уровни детализации">
+        <span style="flex:3">Детализация</span>
+        <select id="qualityPreset" style="flex:6">
+          <option value="poor">Плохая</option>
+          <option value="normal" selected>Нормальная</option>
+          <option value="high">Высокая</option>
+          <option value="ultra">Супер высокая</option>
+        </select>
+      </div>
+      <div class="row">
         <button id="downloadGeojson" onclick="downloadGeoJSON()">Download GeoJSON</button>
       </div>
       <div id="dropHint" style="padding:6px;border:1px dashed #bbb;border-radius:4px;background:#fafafa;color:#666;text-align:center;">
@@ -67,6 +97,7 @@
       </div>
     </div>
     <script type="module" src="index.js"></script>
+    <script type="module" src="editor.js"></script>
     <script>
       function downloadGeoJSON() {
         try {
