@@ -7,10 +7,24 @@ import {
   fc,
 } from './xodr/geometry.js';
 
-const DEBUG = false; // set true to enable verbose logging & debug layers
+// Provide editor with projectors (WGS84 <-> local meters) based on current model header if present
+window.editorGetProjectors = function editorGetProjectors() {
+  try {
+    const lat0 = (currentModel && currentModel.header && currentModel.header.lat0) ?? centerLat;
+    const lon0 = (currentModel && currentModel.header && currentModel.header.lon0) ?? centerLon;
+    const projDef = +proj=tmerc +lat_0={lat0} +lon_0={lon0} +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs;
+    const LOCAL_ED = proj4(projDef);
+    const toLocal = (lnglat) => { try { return proj4('WGS84', LOCAL_ED, lnglat); } catch { return lnglat; } };
+    const toWgs = (xy) => { try { return proj4(LOCAL_ED, 'WGS84', xy); } catch { return xy; } };
+    return { toLocal, toWgs };
+  } catch {
+    const toLocal = (lnglat) => lnglat;
+    const toWgs = (xy) => xy;
+    return { toLocal, toWgs };
+  }
+};
 
-mapboxgl.accessToken =
-  "pk.eyJ1IjoieWFucG9ndXRzYSIsImEiOiJjajBhMzJydzIwZmtmMndvY3ozejFicTdqIn0.T6DCFk1BSoEkdG-2agIoQQ";
+const DEBUG = false; // set true to enable verbose logging & debug layers
 const CENTER_LONLAT = [76.9373962233488, 43.23986449911439];
 
 var map = new mapboxgl.Map({
@@ -104,7 +118,10 @@ window.addEventListener('DOMContentLoaded', () => {
     inp.click();
   });
   document.getElementById('exportXodr').addEventListener('click', () => {
-    const text = lastXodrText || '';
+    // Prefer editor-generated XODR if available
+    let text = '';
+    try { if (window.EditorExportXodr) text = window.EditorExportXodr(); } catch {}
+    if (!text) text = lastXodrText || '';
     const blob = new Blob([text], { type: 'application/xml' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -157,7 +174,10 @@ window.addEventListener('DOMContentLoaded', () => {
   // Editor UI wired in editor.js
 
   // Try to load bundled test.xodr automatically
-  fetch('test.xodr').then(r => r.text()).then(t => { lastXodrText = t; loadXodr(t); }).catch(() => {});
+  const AUTO_LOAD_XODR = false; // disable auto-loading heavy sample to reduce lag
+  if (AUTO_LOAD_XODR) {
+    fetch('test.xodr').then(r => r.text()).then(t => { lastXodrText = t; loadXodr(t); }).catch(() => {});
+  }
 });
 
 function loadXodr(xmlText) {
@@ -170,6 +190,42 @@ function loadXodr(xmlText) {
     if (mapLoaded) {
       ensureLayers();
       updateSources(geo);
+    }
+    // Prefer embedded editor axes if present in userData; otherwise, ingest from centerlines
+    let ingested = false;
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(xmlText, 'application/xml');
+      const ed = doc.querySelector('OpenDRIVE > userData > editorAxes');
+      if (ed) {
+        const raw = (ed.textContent || '').trim();
+        if (raw) {
+          const data = JSON.parse(raw);
+          if (Array.isArray(data)) {
+            if (window.editorIngestEditorAxes) { window.editorIngestEditorAxes(data); ingested = true; }
+            else {
+              // Defer until editor module is ready
+              window.__EDITOR_AXES_BUFFER = data;
+              if (!window.__EDITOR_AXES_WAIT) {
+                window.__EDITOR_AXES_WAIT = setInterval(() => {
+                  try {
+                    if (window.editorIngestEditorAxes && window.__EDITOR_AXES_BUFFER) {
+                      window.editorIngestEditorAxes(window.__EDITOR_AXES_BUFFER);
+                      window.__EDITOR_AXES_BUFFER = null;
+                      clearInterval(window.__EDITOR_AXES_WAIT);
+                      window.__EDITOR_AXES_WAIT = null;
+                    }
+                  } catch {}
+                }, 50);
+              }
+              ingested = true; // we'll ingest shortly
+            }
+          }
+        }
+      }
+    } catch (e) { console.warn('[loadXodr] userData.editorAxes parse failed', e); }
+    if (!ingested) {
+      try { if (window.editorIngestFromCenterlines) window.editorIngestFromCenterlines(geo.centerlines); } catch {}
     }
     if (geo.bounds) {
       map.fitBounds(geo.bounds, { padding: 40, duration: 0 });
@@ -955,6 +1011,35 @@ window.buildGeo = function buildGeo() {
   } catch (e) {
     return currentGeo || { centerlines: fc(), lanes: fc(), sidewalks: fc(), markings: fc(), edges: fc(), intersection: fc() };
   }
+}
+
+// Allow editor.js to push its generated XODR-like geometry
+window.applyEditorXodr = function applyEditorXodr(geoOverlay) {
+  try {
+    ensureLayers();
+    // Merge overlay with current base geometry if present (non-destructive)
+    const base = currentGeo || { centerlines: fc(), lanes: fc(), markings: fc(), edges: fc() };
+    const merge = (a,b) => fc([...(a?.features||[]), ...(b?.features||[])]);
+    const combined = {
+      centerlines: merge(base.centerlines, geoOverlay.centerlines),
+      lanes: merge(base.lanes, geoOverlay.lanes),
+      markings: merge(base.markings, geoOverlay.markings),
+      edges: merge(base.edges, geoOverlay.edges),
+    };
+    updateSources(combined);
+  } catch (e) {
+    console.warn('[editor] failed to apply XODR view:', e);
+  }
+}
+// Hide base XODR features for given road names (editor axes) to avoid duplication with editor overlay
+window.filterBaseXodrForEditor = function filterBaseXodrForEditor(roadNames = []) {
+  try {
+    ensureLayers();
+    const names = Array.isArray(roadNames) ? roadNames : [];
+    const filtNotIn = ['match', ['get','roadName'], names, false, true];
+    if (map.getLayer('xodr-lanes')) map.setFilter('xodr-lanes', filtNotIn);
+    if (map.getLayer('xodr-center')) map.setFilter('xodr-center', filtNotIn);
+  } catch (e) { console.warn('[editor] base filter failed', e); }
 }
 
 function clearSources() {
